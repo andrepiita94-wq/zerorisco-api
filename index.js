@@ -8,33 +8,46 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('render.com') || process.env.NODE_ENV === 'production'
-    ? { rejectUnauthorized: false }
-    : false,
-});
+// Inicia mesmo sem DATABASE_URL — falha graciosamente por request
+let pool = null;
+let dbReady = false;
 
-async function migrate() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS incidents (
-      id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-      type TEXT NOT NULL,
-      lat REAL NOT NULL,
-      lng REAL NOT NULL,
-      reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      expires_at TIMESTAMPTZ NOT NULL
-    )
-  `);
-  await pool.query('DELETE FROM incidents WHERE expires_at < NOW()');
-  console.log('[DB] Migrated and cleaned up expired incidents');
+async function initDb() {
+  const connStr = process.env.DATABASE_URL;
+  if (!connStr) {
+    console.warn('[DB] DATABASE_URL não configurada — rodando sem banco de dados');
+    return;
+  }
+  try {
+    pool = new Pool({
+      connectionString: connStr,
+      ssl: { rejectUnauthorized: false },
+    });
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS incidents (
+        id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        type TEXT NOT NULL,
+        lat REAL NOT NULL,
+        lng REAL NOT NULL,
+        reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL
+      )
+    `);
+    await pool.query('DELETE FROM incidents WHERE expires_at < NOW()');
+    dbReady = true;
+    console.log('[DB] Conectado e migrado com sucesso');
+  } catch (err) {
+    console.error('[DB] Erro ao conectar:', err.message);
+    pool = null;
+  }
 }
 
 app.get('/api/healthz', (_req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
+  res.json({ status: 'ok', db: dbReady, time: new Date().toISOString() });
 });
 
 app.get('/api/incidents', async (_req, res) => {
+  if (!pool) return res.json([]);
   try {
     const { rows } = await pool.query(
       'SELECT id, type, lat, lng, reported_at, expires_at FROM incidents WHERE expires_at > NOW() ORDER BY reported_at DESC'
@@ -42,11 +55,12 @@ app.get('/api/incidents', async (_req, res) => {
     res.json(rows);
   } catch (err) {
     console.error('GET /incidents error:', err.message);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Erro no banco de dados' });
   }
 });
 
 app.post('/api/incidents', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Banco de dados não configurado' });
   const { type, lat, lng } = req.body ?? {};
   if (!type || lat == null || lng == null) {
     return res.status(400).json({ error: 'type, lat e lng são obrigatórios' });
@@ -60,17 +74,26 @@ app.post('/api/incidents', async (req, res) => {
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error('POST /incidents error:', err.message);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Erro no banco de dados' });
   }
 });
 
 app.delete('/api/incidents/:id', async (req, res) => {
-  await pool.query('DELETE FROM incidents WHERE id = $1', [req.params.id]);
-  res.status(204).end();
+  if (!pool) return res.status(503).json({ error: 'Banco de dados não configurado' });
+  try {
+    await pool.query('DELETE FROM incidents WHERE id = $1', [req.params.id]);
+    res.status(204).end();
+  } catch (err) {
+    console.error('DELETE /incidents error:', err.message);
+    res.status(500).json({ error: 'Erro no banco de dados' });
+  }
 });
 
 const port = parseInt(process.env.PORT || '3000', 10);
 
-migrate()
-  .then(() => app.listen(port, () => console.log(`ZeroRisco API rodando na porta ${port}`)))
-  .catch(err => { console.error('Erro fatal:', err); process.exit(1); });
+// Inicia o servidor ANTES de conectar ao banco
+app.listen(port, () => {
+  console.log(`ZeroRisco API rodando na porta ${port}`);
+  // Conecta ao banco em background (sem bloquear o startup)
+  initDb().catch(err => console.error('[DB] Falha na inicialização:', err.message));
+});
